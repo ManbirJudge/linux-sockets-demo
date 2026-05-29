@@ -15,7 +15,7 @@ void print_err(const char *your_msg) {
     printf("Error: %s\n  (%d) %s\n", your_msg, code, strerror(code));
 }
 
-void print_bytes(byte *bytes, size_t len) {
+void print_bytes(const byte *bytes, size_t len) {
     for (size_t i = 0; i < len; i++) printf("%02x ", bytes[i]);
     printf("\n");
 }

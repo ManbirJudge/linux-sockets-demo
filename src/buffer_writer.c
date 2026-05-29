@@ -11,11 +11,11 @@ BufWriter bw_init() {
     };
 }
 
-bool bw_write(BufWriter *bw, const void *src, size_t n) {
+bool bw_write(BufWriter *bw, const void *src, size_t size) {
     if (!bw->data) return false;
 
-    if (n > bw->cap - bw->size) {
-        size_t new_cap = bw->size + n;
+    if (size > bw->cap - bw->size) {
+        size_t new_cap = bw->size + size;
         new_cap--;
         new_cap |= new_cap >> 1;
         new_cap |= new_cap >> 2;
@@ -32,8 +32,8 @@ bool bw_write(BufWriter *bw, const void *src, size_t n) {
         if (!bw->data) return false;
     }
 
-    memcpy(bw->data + bw->size, src, n);
-    bw->size += n;
+    memcpy(bw->data + bw->size, src, size);
+    bw->size += size;
 
     return true;
 }
