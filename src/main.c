@@ -17,7 +17,10 @@
 #include "utils.h"
 
 // types, enums and structures
-#define DNS_TYPE_A 1
+#define DNS_TYPE_A    1
+#define DNS_TYPE_NS   2
+#define DNS_TYPE_MX   15
+#define DNS_TYPE_AAAA 28
 
 #define DNS_CLASS_IN 1
 
@@ -42,7 +45,7 @@ typedef struct {
     u16 class;
     u32 ttl;
     u16 data_len;
-    byte *data;
+    size_t _data_off;
 } DNSRecord;
 
 typedef struct {
@@ -61,15 +64,15 @@ void free_dns_request(DNSRequest *req) {
         str_free(&req->questions[i].name);
     for (u16 i = 0, n = req->header.ans_count; i < n; i++) {
         str_free(&req->answers[i].name);
-        if (req->answers[i].data) free(req->answers[i].data);
+        // if (req->answers[i].data) free(req->answers[i].data);
     }
     for (u16 i = 0, n = req->header.authority_count; i < n; i++) {
         str_free(&req->authorities[i].name);
-        if (req->authorities[i].data) free(req->authorities[i].data);
+        // if (req->authorities[i].data) free(req->authorities[i].data);
     }
     for (u16 i = 0, n = req->header.additional_count; i < n; i++) {
         str_free(&req->additionals[i].name);
-        if (req->additionals[i].data) free(req->additionals[i].data);
+        // if (req->additionals[i].data) free(req->additionals[i].data);
     }
     
     if (req->questions) free(req->questions);
@@ -197,9 +200,12 @@ bool deserialize_dns_record(BufReader *br, DNSRecord *record) {
             && br_read_u32_be(br, &record->ttl)
             && br_read_u16_be(br, &record->data_len);
     if (!ret) return false;
-    record->data = malloc(record->data_len);
-    if (!record->data) return false;
-    return br_read_bytes(br, record->data, record->data_len);
+    
+    record->_data_off = br->pos;
+
+    br->pos += record->data_len;
+    
+    return true;
 }
 
 bool deserialize_dns_resp(BufReader *br, DNSResponse *resp) {
@@ -251,7 +257,7 @@ int main(void) {
     req.questions = malloc(sizeof(DNSQuestion));
     req.questions[0] = (DNSQuestion){
         .name = str_new(domain_name),
-        .type = DNS_TYPE_A,
+        .type = DNS_TYPE_MX,
         .class = DNS_CLASS_IN
     };
 
@@ -327,16 +333,76 @@ int main(void) {
         return 4;
     }
 
-    printf("\nIPv4 addresses (if any):\n");
+    printf("\n");
     for (size_t i = 0, n = resp.header.ans_count; i < n; i++) {
         const DNSRecord *ans = &resp.answers[i];
-        if (ans->type == DNS_TYPE_A) {
-            printf("%u.%u.%u.%u\n",
-                ans->data[0],
-                ans->data[1],
-                ans->data[2],
-                ans->data[3]
-            );
+        switch (ans->type) {
+            case DNS_TYPE_A: {
+                if (ans->data_len != 4) {
+                    printf("Invalid IPv4 record data lenght.\n");
+                    break;
+                }
+                printf("IPv4: %u.%u.%u.%u\n",
+                    br.data[ans->_data_off],
+                    br.data[ans->_data_off + 1],
+                    br.data[ans->_data_off + 2],
+                    br.data[ans->_data_off + 3]
+                );
+                break;
+            }
+            case DNS_TYPE_AAAA: {
+                if (ans->data_len != 16) {
+                    printf("Invalid IPv6 record data lenght.\n");
+                    break;
+                }
+
+                struct in6_addr ipv6_addr;
+                memcpy(&ipv6_addr, br.data + ans->_data_off, 16);
+
+                char ipv6_addr_str[INET6_ADDRSTRLEN];
+                if (inet_ntop(AF_INET6, &addr, ipv6_addr_str, sizeof(ipv6_addr_str)) == NULL) {
+                    perror("abcd");
+                    break;
+                }
+
+                printf("IPv6: %s\n", ipv6_addr_str);
+
+                break;
+            }
+            // case DNS_TYPE_NS: {
+            //     String ns;
+
+            //     BufReader br = br_init(ans->data, ans->data_len);
+            //     if (!deserialize_dns_name(&br, &ns)) {
+            //         printf("Failed to deserialize NS.\n");
+            //         break;
+            //     }
+
+            //     printf("NS: %s\n", ns.data);
+
+            //     break;
+            // }
+            case DNS_TYPE_MX: {
+                struct {
+                    u16 priority;
+                    String domain_name;
+                } mail_data;
+
+                br.pos = ans->_data_off;
+
+                br_read_u16_be(&br, &mail_data.priority);
+                deserialize_dns_name(&br, &mail_data.domain_name);
+
+                printf("MX:\n  Priority: %u\n  Domain: %s\n", mail_data.priority, mail_data.domain_name.data);
+
+                str_free(&mail_data.domain_name);
+
+                break;
+            }
+            default: {
+                printf("Warning: Unkown record type: %u\n", ans->type);
+                break;
+            }
         }
     }
 
