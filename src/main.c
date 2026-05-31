@@ -18,13 +18,14 @@
 #include "utils.h"
 
 // types, enums and structures
-#define DNS_TYPE_A    1
-#define DNS_TYPE_NS   2
-#define DNS_TYPE_MX   15
-#define DNS_TYPE_TXT  16
-#define DNS_TYPE_RP   17
-#define DNS_TYPE_AAAA 28
-#define DNS_TYPE_LOC  29
+#define DNS_TYPE_A     1
+#define DNS_TYPE_NS    2
+#define DNS_TYPE_CNAME 5
+#define DNS_TYPE_MX    15
+#define DNS_TYPE_TXT   16
+#define DNS_TYPE_RP    17
+#define DNS_TYPE_AAAA  28
+#define DNS_TYPE_LOC   29
 
 #define DNS_CLASS_IN 1
 
@@ -141,9 +142,10 @@ bool serialize_dns_request(BufWriter *bw, const DNSRequest *req) {
 }
 
 // deserialization
-bool deserialize_dns_name(BufReader *br, String *str) {
+bool deserialize_dns_name(BufReader *br, String *str, bool top_lvl) {
     BufWriter name_writer = bw_init();
 
+    bool jumped = false;
     size_t old_pos = 0;
     u8 section_size;
     br_read_u8(br, &section_size);
@@ -153,11 +155,12 @@ bool deserialize_dns_name(BufReader *br, String *str) {
             br_read_u8(br, &_tmp);
             u16 off = ((section_size & 0b00111111) << 8) | _tmp;
 
+            jumped = true;
             old_pos = br->pos;
             br->pos = off;
 
             String section;
-            deserialize_dns_name(br, &section);
+            deserialize_dns_name(br, &section, false);
 
             bw_write(&name_writer, section.data, section.len);
             str_free(&section);
@@ -172,11 +175,10 @@ bool deserialize_dns_name(BufReader *br, String *str) {
         }
         br_read_u8(br, &section_size);
     }
-    if (old_pos != 0) br->pos = old_pos;
+    if (jumped) br->pos = old_pos;
+    
+    if (top_lvl) name_writer.size--;  // removing last '.'
 
-    name_writer.size--;
-
-    // str_free(str);
     *str = str_from_bw(&name_writer);
 
     return true;
@@ -192,13 +194,13 @@ bool deserialize_dns_header(BufReader *br, DNSHeader *header) {
 }
 
 bool deserialize_dns_question(BufReader *br, DNSQuestion *ques) {
-    return deserialize_dns_name(br, &ques->name)
+    return deserialize_dns_name(br, &ques->name, true)
         && br_read_u16_be(br, &ques->type)
         && br_read_u16_be(br, &ques->class);
 }
 
 bool deserialize_dns_record(BufReader *br, DNSRecord *record) {
-    bool ret = deserialize_dns_name(br, &record->name)
+    bool ret = deserialize_dns_name(br, &record->name, true)
             && br_read_u16_be(br, &record->type)
             && br_read_u16_be(br, &record->class)
             && br_read_u32_be(br, &record->ttl)
@@ -261,7 +263,7 @@ int main(void) {
     req.questions = malloc(sizeof(DNSQuestion));
     req.questions[0] = (DNSQuestion){
         .name = str_new(domain_name),
-        .type = DNS_TYPE_LOC,
+        .type = DNS_TYPE_NS,
         .class = DNS_CLASS_IN
     };
 
@@ -383,19 +385,6 @@ int main(void) {
 
                 break;
             }
-            // case DNS_TYPE_NS: {
-            //     String ns;
-
-            //     BufReader br = br_init(ans->data, ans->data_len);
-            //     if (!deserialize_dns_name(&br, &ns)) {
-            //         printf("Failed to deserialize NS.\n");
-            //         break;
-            //     }
-
-            //     printf("NS: %s\n", ns.data);
-
-            //     break;
-            // }
             case DNS_TYPE_MX: {
                 struct {
                     u16 priority;
@@ -405,7 +394,7 @@ int main(void) {
                 br.pos = ans->_data_off;
 
                 br_read_u16_be(&br, &mail_data.priority);
-                deserialize_dns_name(&br, &mail_data.domain_name);
+                deserialize_dns_name(&br, &mail_data.domain_name, true);
 
                 printf("MX:\n  Priority: %u\n  Domain: %s\n", mail_data.priority, mail_data.domain_name.data);
 
@@ -421,8 +410,8 @@ int main(void) {
 
                 br.pos = ans->_data_off;
 
-                deserialize_dns_name(&br, &responsible_person.mail_box_domain);
-                deserialize_dns_name(&br, &responsible_person.txt_domain);
+                deserialize_dns_name(&br, &responsible_person.mail_box_domain, true);
+                deserialize_dns_name(&br, &responsible_person.txt_domain, true);
 
                 printf("Responsible person:\n  Mailbox domain: %s\n  Text domain: %s\n", responsible_person.mail_box_domain.data, responsible_person.txt_domain.data);
 
@@ -514,6 +503,26 @@ int main(void) {
                     vert_precision
                 );
 
+                break;
+            }
+            case DNS_TYPE_CNAME: {
+                String canonical_name;
+                
+                br.pos = ans->_data_off;
+                deserialize_dns_name(&br, &canonical_name, true);
+
+                printf("Canonical name: %s\n", canonical_name.data);
+
+                break;
+            }
+            case DNS_TYPE_NS: {
+                String nameserver_domain_name;
+                
+                br.pos = ans->_data_off;
+                deserialize_dns_name(&br, &nameserver_domain_name, true);
+
+                printf("Name-server domain name: %s\n", nameserver_domain_name.data);
+                
                 break;
             }
             default: {
