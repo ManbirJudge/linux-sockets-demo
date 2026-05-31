@@ -28,3 +28,4 @@ target_compile_options(LearningSMTP PRIVATE
         -Wextra
     >
 )
+target_link_libraries(LearningSMTP PRIVATE m)

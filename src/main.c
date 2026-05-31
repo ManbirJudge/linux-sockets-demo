@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdalign.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -20,7 +21,10 @@
 #define DNS_TYPE_A    1
 #define DNS_TYPE_NS   2
 #define DNS_TYPE_MX   15
+#define DNS_TYPE_TXT  16
+#define DNS_TYPE_RP   17
 #define DNS_TYPE_AAAA 28
+#define DNS_TYPE_LOC  29
 
 #define DNS_CLASS_IN 1
 
@@ -248,7 +252,7 @@ int main(void) {
     DNSRequest req = {0};
     req.header = (DNSHeader){
         .transaction_id = rand_u16(),
-        .flags = 0,
+        .flags = 0x0100,
         .ques_count = 1,
         .ans_count = 0,
         .authority_count = 0,
@@ -257,7 +261,7 @@ int main(void) {
     req.questions = malloc(sizeof(DNSQuestion));
     req.questions[0] = (DNSQuestion){
         .name = str_new(domain_name),
-        .type = DNS_TYPE_MX,
+        .type = DNS_TYPE_LOC,
         .class = DNS_CLASS_IN
     };
 
@@ -271,6 +275,9 @@ int main(void) {
         return 2;
     }
 
+    printf("\nRequest:\n");
+    print_bytes(bw.data, bw.size);
+
     // initalize socket
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd == -1) {
@@ -281,7 +288,7 @@ int main(void) {
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(53);
-    inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr);
+    inet_pton(AF_INET, "192.168.1.1", &addr.sin_addr);
 
     long sent_size = sendto(
         fd,
@@ -323,7 +330,7 @@ int main(void) {
     // read reponse
     BufReader br = br_init(buf, recv_size);
 
-    printf("Raw response:\n");
+    printf("\nRaw response:\n");
     print_bytes(br.data, br.size);
 
     DNSResponse resp = {0};
@@ -333,8 +340,15 @@ int main(void) {
         return 4;
     }
 
+    printf("\nCount:\n  Questions: %u\n  Answers: %u\n  Authorities: %u\n  Additionals: %u\n",
+        resp.header.ques_count,
+        resp.header.ans_count,
+        resp.header.authority_count,
+        resp.header.additional_count
+    );
+
     printf("\n");
-    for (size_t i = 0, n = resp.header.ans_count; i < n; i++) {
+    for (size_t i = 0, n = resp.header.ans_count; i < n; i++) {  // TODO: maybe use a local BufReader to automatically enforce record boundries
         const DNSRecord *ans = &resp.answers[i];
         switch (ans->type) {
             case DNS_TYPE_A: {
@@ -396,6 +410,109 @@ int main(void) {
                 printf("MX:\n  Priority: %u\n  Domain: %s\n", mail_data.priority, mail_data.domain_name.data);
 
                 str_free(&mail_data.domain_name);
+
+                break;
+            }
+            case DNS_TYPE_RP: {
+                struct {
+                    String mail_box_domain;
+                    String txt_domain;
+                } responsible_person;
+
+                br.pos = ans->_data_off;
+
+                deserialize_dns_name(&br, &responsible_person.mail_box_domain);
+                deserialize_dns_name(&br, &responsible_person.txt_domain);
+
+                printf("Responsible person:\n  Mailbox domain: %s\n  Text domain: %s\n", responsible_person.mail_box_domain.data, responsible_person.txt_domain.data);
+
+                str_free(&responsible_person.mail_box_domain);
+                str_free(&responsible_person.txt_domain);
+
+                break;
+            }
+            case DNS_TYPE_TXT: {
+                br.pos = ans->_data_off;
+                size_t ans_end = ans->_data_off + ans->data_len;
+
+                printf("TXT:\n");
+                while (br.pos < ans_end) {
+                    u8 txt_len;
+                    br_read_u8(&br, &txt_len);
+
+                    if (br.pos + txt_len > ans_end) break;
+
+                    unsigned char txt[txt_len + 1];
+                    br_read_bytes(&br, txt, txt_len);
+                    txt[txt_len] = '\0';
+
+                    printf("  - %s\n", txt);
+                }
+
+                break;
+            }
+            case DNS_TYPE_LOC: {
+                struct {
+                    u8 ver;
+                    u8 size;
+                    u8 horiz_precision;
+                    u8 vert_precision;
+
+                    u32 latitude;
+                    u32 longitude;
+                    u32 altitue;
+                } location_data_raw;
+                
+                br.pos = ans->_data_off;
+
+                br_read_u8(&br, &location_data_raw.ver);
+                if (location_data_raw.ver != 0) break;
+
+                br_read_u8(&br, &location_data_raw.size);
+                br_read_u8(&br, &location_data_raw.horiz_precision);
+                br_read_u8(&br, &location_data_raw.vert_precision);
+                br_read_u32_be(&br, &location_data_raw.latitude);
+                br_read_u32_be(&br, &location_data_raw.longitude);
+                br_read_u32_be(&br, &location_data_raw.altitue);
+
+                int size_base = location_data_raw.size >> 4;
+                int size_exponent = location_data_raw.size & 0x0f;
+                float size = (float)size_base * powf(10.f, (float)size_exponent - 3.f);
+                
+                int horiz_pre_base = location_data_raw.horiz_precision >> 4;
+                int horiz_pre_exponent = location_data_raw.horiz_precision & 0x0f;
+                float horiz_precision = (float)horiz_pre_base * powf(10.f, (float)horiz_pre_exponent - 3.f);  // m
+                
+                int vert_pre_base = location_data_raw.vert_precision >> 4;
+                int vert_pre_exponent = location_data_raw.vert_precision & 0x0f;
+                float vert_precision = (float)vert_pre_base * powf(10.f, (float)vert_pre_exponent - 3.f);  // m
+
+                float latitude  = (float)((i64)location_data_raw.latitude  - 2147483648LL) / 3600000.f;  // degrees
+                float longitude = (float)((i64)location_data_raw.longitude - 2147483648LL) / 3600000.f; // degrees
+
+                float altitude = (float)(location_data_raw.altitue - 10000000) / 100.;  // m
+
+                char _lat_dir = (latitude  >= 0) ? 'N' : 'S';
+                char _lon_dir = (longitude >= 0) ? 'E' : 'W';
+                float _lat_abs = fabs(latitude);
+                float _lon_abs = fabs(longitude);
+                int   _lat_deg     = (int)_lat_abs;
+                float _lat_rem_min = (_lat_abs - _lat_deg) * 60.f;
+                int   _lat_min     = (int)_lat_rem_min;
+                float _lat_sec     = (_lat_rem_min - _lat_min) * 60.f;
+                int   _lon_deg     = (int)_lon_abs;
+                float _lon_rem_min = (_lon_abs - _lon_deg) * 60.f;
+                int   _lon_min     = (int)_lon_rem_min;
+                float _lon_sec     = (_lon_rem_min - _lon_min) * 60.f;
+
+                printf("Location data:\n  Coordaintes: %d°%d'%.2f\" %c, %d°%d'%.2f\" %c\n  Altitude: %.2f m\n  Size: %.2f m\n  Horizontal precisoin: %.2f m\n  Vertical precision: %.2f m\n",
+                    _lat_deg, _lat_min, _lat_sec, _lat_dir, 
+                    _lon_deg, _lon_min, _lon_sec, _lon_dir, 
+                    altitude,
+                    size, 
+                    horiz_precision,
+                    vert_precision
+                );
 
                 break;
             }
