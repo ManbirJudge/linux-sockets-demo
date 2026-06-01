@@ -1,5 +1,5 @@
-#include <math.h>
 #include <stdalign.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,11 +11,18 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "endianess.h"
+#include "list.h"
 #include "types.h"
 #include "buffer_writer.h"
 #include "buffer_reader.h"
 #include "my_string.h"
+#include "hash_table.h"
+#include "log.h"
 #include "utils.h"
+
+// ---
+DECLARE_LIST(u32, ListU32);
 
 // types, enums and structures
 #define DNS_TYPE_A     1
@@ -67,18 +74,12 @@ typedef DNSRequest DNSResponse;
 void free_dns_request(DNSRequest *req) {
     for (u16 i = 0, n = req->header.ques_count; i < n; i++)
         str_free(&req->questions[i].name);
-    for (u16 i = 0, n = req->header.ans_count; i < n; i++) {
+    for (u16 i = 0, n = req->header.ans_count; i < n; i++)
         str_free(&req->answers[i].name);
-        // if (req->answers[i].data) free(req->answers[i].data);
-    }
-    for (u16 i = 0, n = req->header.authority_count; i < n; i++) {
+    for (u16 i = 0, n = req->header.authority_count; i < n; i++)
         str_free(&req->authorities[i].name);
-        // if (req->authorities[i].data) free(req->authorities[i].data);
-    }
-    for (u16 i = 0, n = req->header.additional_count; i < n; i++) {
+    for (u16 i = 0, n = req->header.additional_count; i < n; i++)
         str_free(&req->additionals[i].name);
-        // if (req->additionals[i].data) free(req->additionals[i].data);
-    }
     
     if (req->questions) free(req->questions);
     if (req->answers) free(req->answers);
@@ -121,6 +122,8 @@ bool serialize_dns_question(BufWriter *bw, const DNSQuestion *ques) {
 }
 
 bool serialize_dns_record(BufWriter *bw, const DNSRecord *record) {
+    UNUSED(bw);
+    UNUSED(record);
     return false;
 }
 
@@ -238,23 +241,88 @@ bool deserialize_dns_resp(BufReader *br, DNSResponse *resp) {
     return true;
 }
 
-// main
-int main(void) {
-    // init
-    srand((unsigned)time(NULL));
-    
-    // user input
-    char domain_name[256] = {0};
+// resolver
+static const byte ROOT_DNS_SERVERS[][4] = {
+    { 198, 41 , 0  , 4   },
+    { 170, 247, 170, 2   },
+    { 192, 33 , 4  , 12  },
+    { 199, 7  , 91 , 13  },
+    { 192, 203, 230, 10  },
+    { 192, 5  , 5  , 241 },
+    { 192, 112, 36 , 4   },
+    { 198, 97 , 190, 53  },
+    { 192, 36 , 148, 17  },
+    { 192, 58 , 128, 30  },
+    { 193, 0  , 14 , 129 },
+    { 199, 7  , 83 , 42  },
+    { 202, 12 , 27 , 33  }
+};
 
-    printf("Enter a domain name: ");
-    scanf("%255s", domain_name);
-    if (strlen(domain_name) == 0) strcpy(domain_name, "google.com");
+typedef struct {
+    bool success;
+    ListU32 addresses;
+    String err;
+} DNSResult;
 
-    // initialize request
+typedef struct {
+    HT *cache;
+    struct {
+        int lvl;
+    } dbg_info;
+} DNSResolver;
+
+DNSResolver dns_resolver_new() {
+    return (DNSResolver){
+        ht_create(20),
+        {
+            .lvl = 0
+        }
+    };
+}
+
+void dns_resolver_free(DNSResolver *resolver) {
+    if (resolver) {
+        ht_free(resolver->cache);
+        resolver->cache = NULL;
+    }
+}
+
+void dns_result_free(DNSResult *res) {
+    if (res) {
+        ListU32_free(&res->addresses);
+        str_free(&res->err);
+
+        res->success = false;
+        ListU32_init(&res->addresses);
+        res->err = (String){0};
+    }
+}
+
+#define TIMEOUT 2
+
+DNSResult dns_resolve_ipv4(DNSResolver *resolver, String domain_name) {
+    bool found = false;
+
+    ListU32 addresses = {0};
+    String err = {0};
+
+    ListU32 server_addresses = {0};
+    ListU32_push(&server_addresses, (
+        ((u32)ROOT_DNS_SERVERS[0][0] << 24) |
+        ((u32)ROOT_DNS_SERVERS[0][1] << 16) |
+        ((u32)ROOT_DNS_SERVERS[0][2] << 8)  |
+        ((u32)ROOT_DNS_SERVERS[0][3])
+    ));
+
+    int sock_fd = -1;
+
+    DNSResponse resp = {0};
+
+    // create request
     DNSRequest req = {0};
     req.header = (DNSHeader){
         .transaction_id = rand_u16(),
-        .flags = 0x0100,
+        .flags = 0,
         .ques_count = 1,
         .ans_count = 0,
         .authority_count = 0,
@@ -262,279 +330,260 @@ int main(void) {
     };
     req.questions = malloc(sizeof(DNSQuestion));
     req.questions[0] = (DNSQuestion){
-        .name = str_new(domain_name),
-        .type = DNS_TYPE_NS,
+        .name = str_new(domain_name.data),
+        .type = DNS_TYPE_A,
         .class = DNS_CLASS_IN
     };
 
     BufWriter bw = bw_init();
-    int ret = serialize_dns_request(&bw, &req);
+    bool ret = serialize_dns_request(&bw, &req);
 
-    free_dns_request(&req);
-    
     if (!ret) {
-        printf("Error: Failed to serialize DNS request.");
-        return 2;
+        err = str_new("Error: Failed to serialize request.");
+        goto exit;
     }
 
-    printf("\nRequest:\n");
-    print_bytes(bw.data, bw.size);
-
-    // initalize socket
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
-        print_err("Failed to open socket.");
-        return 1;
+    // setup socket
+    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd == -1) {
+        err = fmt_linux_err("Failed to create socket.");
+        goto exit;
     }
+    
+    struct timeval timeout = {
+        .tv_sec = TIMEOUT,
+        .tv_usec = 0
+    };
+    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(53);
-    inet_pton(AF_INET, "192.168.1.1", &addr.sin_addr);
+
+redo:
+    // send request
+    req.header.transaction_id = rand_u16();
+
+    if (server_addresses.size == 0) {
+        err = str_new("Error: Ran out of DNS servers.");
+        goto exit;
+    }
+    addr.sin_addr.s_addr = swap_32(ListU32_pop(&server_addresses));
+    // LOG_D("Resolving %s from %s.", domain_name.data, inet_ntoa(addr.sin_addr));
+    
+    LOG_D(
+        "Query=%s Server=%s TXID=%u",
+        req.questions[0].name.data,
+        inet_ntoa(addr.sin_addr),
+        req.header.transaction_id
+    );
 
     long sent_size = sendto(
-        fd,
+        sock_fd,
         bw.data, bw.size,
         0,
         (struct sockaddr*)&addr,
-        sizeof(addr)
+        sizeof(struct sockaddr)
     );
     if (sent_size == -1) {
-        print_err("Failed to send request.");
-        return 3;
+        err = fmt_linux_err("Failed to send request.");
+        goto exit;
     }
-
-    struct timeval timeout = {
-        .tv_sec = 2,
-        .tv_usec = 0
-    };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    // send request
+    
+    // receive response
     struct sockaddr_in _addr;
-    socklen_t _addr_size = sizeof(_addr);
+    socklen_t _addr_size = sizeof(struct sockaddr_in);
     byte buf[512];
     long recv_size = recvfrom(
-        fd,
+        sock_fd,
         buf, 512,
         0,
         (struct sockaddr*)&_addr,
         &_addr_size
     );
     if (recv_size == -1) {
-        print_err("Failed to receive.");
-        return 3;
+        err = fmt_linux_err("Failed to receive response.");
+        goto exit;
     }
     
-    close(fd);
-    bw_free(&bw);
-
-    // read reponse
     BufReader br = br_init(buf, recv_size);
-
-    printf("\nRaw response:\n");
-    print_bytes(br.data, br.size);
-
-    DNSResponse resp = {0};
     ret = deserialize_dns_resp(&br, &resp);
     if (!ret) {
-        printf("Error: Failed to deserialize response.\n");
-        return 4;
+        err =  str_new("Error: Failed to deserialize response.");
+        goto exit;
     }
 
-    printf("\nCount:\n  Questions: %u\n  Answers: %u\n  Authorities: %u\n  Additionals: %u\n",
-        resp.header.ques_count,
+    LOG_D(
+        "Response from=%s TXID=%u "
+        "ANS=%u AUTH=%u ADD=%u",
+        inet_ntoa(_addr.sin_addr),
+        resp.header.transaction_id,
         resp.header.ans_count,
         resp.header.authority_count,
         resp.header.additional_count
     );
-
-    printf("\n");
-    for (size_t i = 0, n = resp.header.ans_count; i < n; i++) {  // TODO: maybe use a local BufReader to automatically enforce record boundries
-        const DNSRecord *ans = &resp.answers[i];
-        switch (ans->type) {
+    
+    // cache addresses from additionals section 
+    for (size_t i = 0, n = resp.header.additional_count; i < n; i++) {
+        const DNSRecord *rr = resp.additionals + i;
+        switch (rr->type) {
             case DNS_TYPE_A: {
-                if (ans->data_len != 4) {
-                    printf("Invalid IPv4 record data lenght.\n");
-                    break;
-                }
-                printf("IPv4: %u.%u.%u.%u\n",
-                    br.data[ans->_data_off],
-                    br.data[ans->_data_off + 1],
-                    br.data[ans->_data_off + 2],
-                    br.data[ans->_data_off + 3]
+                const u32 _ipv4_addr_u32 = (
+                    ((u32)br.data[rr->_data_off    ] << 24) |
+                    ((u32)br.data[rr->_data_off + 1] << 16) |
+                    ((u32)br.data[rr->_data_off + 2] << 8 ) |
+                    ((u32)br.data[rr->_data_off + 3]      )
                 );
-                break;
-            }
-            case DNS_TYPE_AAAA: {
-                if (ans->data_len != 16) {
-                    printf("Invalid IPv6 record data lenght.\n");
-                    break;
-                }
-
-                struct in6_addr ipv6_addr;
-                memcpy(&ipv6_addr, br.data + ans->_data_off, 16);
-
-                char ipv6_addr_str[INET6_ADDRSTRLEN];
-                if (inet_ntop(AF_INET6, &addr, ipv6_addr_str, sizeof(ipv6_addr_str)) == NULL) {
-                    perror("abcd");
-                    break;
-                }
-
-                printf("IPv6: %s\n", ipv6_addr_str);
-
-                break;
-            }
-            case DNS_TYPE_MX: {
-                struct {
-                    u16 priority;
-                    String domain_name;
-                } mail_data;
-
-                br.pos = ans->_data_off;
-
-                br_read_u16_be(&br, &mail_data.priority);
-                deserialize_dns_name(&br, &mail_data.domain_name, true);
-
-                printf("MX:\n  Priority: %u\n  Domain: %s\n", mail_data.priority, mail_data.domain_name.data);
-
-                str_free(&mail_data.domain_name);
-
-                break;
-            }
-            case DNS_TYPE_RP: {
-                struct {
-                    String mail_box_domain;
-                    String txt_domain;
-                } responsible_person;
-
-                br.pos = ans->_data_off;
-
-                deserialize_dns_name(&br, &responsible_person.mail_box_domain, true);
-                deserialize_dns_name(&br, &responsible_person.txt_domain, true);
-
-                printf("Responsible person:\n  Mailbox domain: %s\n  Text domain: %s\n", responsible_person.mail_box_domain.data, responsible_person.txt_domain.data);
-
-                str_free(&responsible_person.mail_box_domain);
-                str_free(&responsible_person.txt_domain);
-
-                break;
-            }
-            case DNS_TYPE_TXT: {
-                br.pos = ans->_data_off;
-                size_t ans_end = ans->_data_off + ans->data_len;
-
-                printf("TXT:\n");
-                while (br.pos < ans_end) {
-                    u8 txt_len;
-                    br_read_u8(&br, &txt_len);
-
-                    if (br.pos + txt_len > ans_end) break;
-
-                    unsigned char txt[txt_len + 1];
-                    br_read_bytes(&br, txt, txt_len);
-                    txt[txt_len] = '\0';
-
-                    printf("  - %s\n", txt);
-                }
-
-                break;
-            }
-            case DNS_TYPE_LOC: {
-                struct {
-                    u8 ver;
-                    u8 size;
-                    u8 horiz_precision;
-                    u8 vert_precision;
-
-                    u32 latitude;
-                    u32 longitude;
-                    u32 altitue;
-                } location_data_raw;
-                
-                br.pos = ans->_data_off;
-
-                br_read_u8(&br, &location_data_raw.ver);
-                if (location_data_raw.ver != 0) break;
-
-                br_read_u8(&br, &location_data_raw.size);
-                br_read_u8(&br, &location_data_raw.horiz_precision);
-                br_read_u8(&br, &location_data_raw.vert_precision);
-                br_read_u32_be(&br, &location_data_raw.latitude);
-                br_read_u32_be(&br, &location_data_raw.longitude);
-                br_read_u32_be(&br, &location_data_raw.altitue);
-
-                int size_base = location_data_raw.size >> 4;
-                int size_exponent = location_data_raw.size & 0x0f;
-                float size = (float)size_base * powf(10.f, (float)size_exponent - 3.f);
-                
-                int horiz_pre_base = location_data_raw.horiz_precision >> 4;
-                int horiz_pre_exponent = location_data_raw.horiz_precision & 0x0f;
-                float horiz_precision = (float)horiz_pre_base * powf(10.f, (float)horiz_pre_exponent - 3.f);  // m
-                
-                int vert_pre_base = location_data_raw.vert_precision >> 4;
-                int vert_pre_exponent = location_data_raw.vert_precision & 0x0f;
-                float vert_precision = (float)vert_pre_base * powf(10.f, (float)vert_pre_exponent - 3.f);  // m
-
-                float latitude  = (float)((i64)location_data_raw.latitude  - 2147483648LL) / 3600000.f;  // degrees
-                float longitude = (float)((i64)location_data_raw.longitude - 2147483648LL) / 3600000.f; // degrees
-
-                float altitude = (float)(location_data_raw.altitue - 10000000) / 100.;  // m
-
-                char _lat_dir = (latitude  >= 0) ? 'N' : 'S';
-                char _lon_dir = (longitude >= 0) ? 'E' : 'W';
-                float _lat_abs = fabs(latitude);
-                float _lon_abs = fabs(longitude);
-                int   _lat_deg     = (int)_lat_abs;
-                float _lat_rem_min = (_lat_abs - _lat_deg) * 60.f;
-                int   _lat_min     = (int)_lat_rem_min;
-                float _lat_sec     = (_lat_rem_min - _lat_min) * 60.f;
-                int   _lon_deg     = (int)_lon_abs;
-                float _lon_rem_min = (_lon_abs - _lon_deg) * 60.f;
-                int   _lon_min     = (int)_lon_rem_min;
-                float _lon_sec     = (_lon_rem_min - _lon_min) * 60.f;
-
-                printf("Location data:\n  Coordaintes: %d°%d'%.2f\" %c, %d°%d'%.2f\" %c\n  Altitude: %.2f m\n  Size: %.2f m\n  Horizontal precisoin: %.2f m\n  Vertical precision: %.2f m\n",
-                    _lat_deg, _lat_min, _lat_sec, _lat_dir, 
-                    _lon_deg, _lon_min, _lon_sec, _lon_dir, 
-                    altitude,
-                    size, 
-                    horiz_precision,
-                    vert_precision
+                    
+                ht_put(
+                    resolver->cache,
+                    rr->name.data,
+                    &_ipv4_addr_u32,
+                    sizeof(u32)
                 );
 
-                break;
-            }
-            case DNS_TYPE_CNAME: {
-                String canonical_name;
-                
-                br.pos = ans->_data_off;
-                deserialize_dns_name(&br, &canonical_name, true);
-
-                printf("Canonical name: %s\n", canonical_name.data);
-
-                break;
-            }
-            case DNS_TYPE_NS: {
-                String nameserver_domain_name;
-                
-                br.pos = ans->_data_off;
-                deserialize_dns_name(&br, &nameserver_domain_name, true);
-
-                printf("Name-server domain name: %s\n", nameserver_domain_name.data);
-                
                 break;
             }
             default: {
-                printf("Warning: Unkown record type: %u\n", ans->type);
+                LOG_V("Ignoring additional record of type %u for %s.", rr->type, rr->name.data);
                 break;
             }
         }
     }
 
-    free_dns_response(&resp);
+    // check answers
+    for (size_t i = 0, n = resp.header.ans_count; i < n; i++) {
+        const DNSRecord *ans = resp.answers + i;
+        switch (ans->type) {
+            case DNS_TYPE_A: {
+                const u32 _ipv4_addr_u32 = (
+                    ((u32)br.data[ans->_data_off    ] << 24) |
+                    ((u32)br.data[ans->_data_off + 1] << 16) |
+                    ((u32)br.data[ans->_data_off + 2] << 8 ) |
+                    ((u32)br.data[ans->_data_off + 3]      )
+                );
+
+                ListU32_push(&addresses, _ipv4_addr_u32);
+
+                found = true;
+
+                break;
+            }
+
+            case DNS_TYPE_CNAME: {
+                String canonical_name;
+                br.pos = ans->_data_off;
+                deserialize_dns_name(&br, &canonical_name, true);
+
+                ListU32_clear(&addresses);
+                found = false;
+
+                str_free(&req.questions[0].name);
+                req.questions[0].name = canonical_name;
+
+                bw_free(&bw);
+                serialize_dns_request(&bw, &req);
+
+                goto redo;
+            }
+
+            default: {
+                LOG_V("Unwanted answer of type %u.", ans->type);
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        bool cached_server_found = false;
+
+        // check for provided name-servers or failures if not found
+        for (size_t i = 0, n = resp.header.authority_count; i < n; i++) {
+            const DNSRecord *rr = resp.authorities + i;
+
+            switch (rr->type) {
+                case DNS_TYPE_NS: {
+                    String nameserver_domain_name;
+                    br.pos = rr->_data_off;
+                    deserialize_dns_name(&br, &nameserver_domain_name, true);
+
+                    const u32* cached_addr = ht_get(resolver->cache, nameserver_domain_name.data);
+                    if (cached_addr) {
+                        ListU32_push(&server_addresses, *cached_addr);
+                        cached_server_found = true;
+                    } else if (!cached_server_found) {  // only do if no already cached server is found
+                        DNSResult res = dns_resolve_ipv4(resolver, nameserver_domain_name);
+
+                        if (res.success) {
+                            ht_put(
+                                resolver->cache,
+                                nameserver_domain_name.data,
+                                (void*)ListU32_ptr_at(&res.addresses, 0),
+                                4
+                            );
+
+                            ListU32_push(&server_addresses, ListU32_at(&res.addresses, 0));  // TODO: try all IPv4 addresses for each server too?
+
+                            dns_result_free(&res);
+                        }
+                    }
+
+                    str_free(&nameserver_domain_name);
+
+                    break;
+                }
+            }
+        } 
+
+        free_dns_response(&resp);
+        goto redo;
+    }
+
+exit:
+    if (sock_fd != -1) close(sock_fd);
     
-    // ---
-    printf("\nDONE!\n");
+    free_dns_request(&req);
+    free_dns_response(&resp);
+    bw_free(&bw);
+    ListU32_free(&server_addresses);
+    
+    DNSResult res = {
+        found,
+        addresses,
+        err
+    };
+
+    return res;
+}
+
+// main
+int main(int argc, char **argv) {
+    String domain_name;
+    if (argc != 2) domain_name = str_new("google.com");
+    else domain_name = str_new(argv[1]);
+
+    DNSResolver resolver = dns_resolver_new();
+
+    DNSResult res = dns_resolve_ipv4(&resolver, domain_name);
+
+    if (!res.success) {
+        LOG_E("Couldn't resolve %s.", domain_name.data);
+        LOG_E("%s", res.err.data);
+    } else {
+        for (size_t i = 0; i < res.addresses.size; i++) {
+            LOG_S("%u.%u.%u.%u",
+                (res.addresses.data[i] & 0xff000000) >> 24,
+                (res.addresses.data[i] & 0x00ff0000) >> 16,
+                (res.addresses.data[i] & 0x0000ff00) >> 8,
+                (res.addresses.data[i] & 0x000000ff)
+            );
+        }
+    }
+
+    dns_resolver_free(&resolver);
+    dns_result_free(&res);
+
+    str_free(&domain_name);
+
     return 0;
 }

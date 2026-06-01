@@ -12,6 +12,7 @@ typedef struct {
 
 String str_new(const char* txt);
 String str_from_bw(BufWriter *bw);
+String str_concat(const char* txt1, const char *txt2);
 
 void str_free(String *str);
 
