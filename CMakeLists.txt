@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.13)
-project(LinuxSocketsDemo C)
+project(RDR C)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_executable(LinuxSocketsDemo
+add_executable(RDR
     src/main.c
     src/buffer_writer.c
     src/buffer_reader.c
@@ -13,10 +13,10 @@ add_executable(LinuxSocketsDemo
     src/log.c
     src/utils.c
 )
-target_include_directories(LinuxSocketsDemo PRIVATE
+target_include_directories(RDR PRIVATE
     include
 )
-target_compile_options(LinuxSocketsDemo PRIVATE
+target_compile_options(RDR PRIVATE
     $<$<CONFIG:Debug>:
         -g
         -O0
@@ -30,4 +30,7 @@ target_compile_options(LinuxSocketsDemo PRIVATE
         -Wextra
     >
 )
-target_link_libraries(LinuxSocketsDemo PRIVATE m)
+target_link_libraries(RDR PRIVATE m)
+set_target_properties(RDR PROPERTIES
+    OUTPUT_NAME "rdr"
+)
